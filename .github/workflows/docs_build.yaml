@@ -51,31 +51,29 @@ jobs:
             }
 
             const pullNumber = Number(value);
-            const {data: pull} = await github.rest.pulls.get({
-              owner: context.repo.owner,
-              repo: context.repo.repo,
-              pull_number: pullNumber,
-            });
-            if (pull.state !== 'open') {
-              core.setFailed(`Pull request #${pullNumber} is not open.`);
+            let headSha = context.payload.pull_request?.head?.sha;
+            if (context.eventName === 'workflow_dispatch') {
+              const {data: pull} = await github.rest.pulls.get({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                pull_number: pullNumber,
+              });
+              headSha = pull.head.sha;
+            }
+            if (!/^[0-9a-f]{40}$/.test(headSha ?? '')) {
+              core.setFailed('The pull request head SHA is invalid.');
               return;
             }
 
-            const eventHeadSha = context.payload.pull_request?.head?.sha;
-            if (eventHeadSha && eventHeadSha !== pull.head.sha) {
-              core.setFailed(`Pull request #${pullNumber} changed after this run started.`);
-              return;
-            }
-
-            const revision = `pr-${pullNumber}-${pull.head.sha}`;
+            const revision = `pr-${pullNumber}-${headSha}`;
             core.setOutput('pull-number', String(pullNumber));
-            core.setOutput('head-sha', pull.head.sha);
+            core.setOutput('head-sha', headSha);
             core.setOutput('revision', revision);
 
             const metadata = path.join(process.env.GITHUB_WORKSPACE, 'preview-metadata');
             fs.mkdirSync(metadata, {recursive: true});
             fs.writeFileSync(path.join(metadata, 'pr-number'), `${pullNumber}\n`);
-            fs.writeFileSync(path.join(metadata, 'head-sha'), `${pull.head.sha}\n`);
+            fs.writeFileSync(path.join(metadata, 'head-sha'), `${headSha}\n`);
             fs.writeFileSync(path.join(metadata, 'revision'), `${revision}\n`);
             fs.writeFileSync(path.join(metadata, 'event'), `${context.eventName}\n`);
 

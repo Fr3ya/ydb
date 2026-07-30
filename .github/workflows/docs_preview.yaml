@@ -159,15 +159,6 @@ jobs:
               }
             }
 
-            const {data: pull} = await github.rest.pulls.get({
-              owner: context.repo.owner,
-              repo: context.repo.repo,
-              pull_number: pullNumber,
-            });
-            if (pull.state !== 'open' || pull.head.sha !== headSha) {
-              throw new Error('The pull request is closed or has moved to a newer SHA.');
-            }
-
       - name: Download build log
         uses: actions/download-artifact@v7
         with:
