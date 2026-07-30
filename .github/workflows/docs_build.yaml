@@ -11,11 +11,11 @@ name: Build documentation
 on:
   pull_request:
     paths:
-      - 'ydb/docs/**'
+      - "ydb/docs/**"
   workflow_dispatch:
     inputs:
       pull_number:
-        description: 'Pull Request number to build documentation'
+        description: "Pull Request number to build documentation"
         required: true
         type: string
 
@@ -30,15 +30,68 @@ jobs:
     runs-on: ubuntu-latest
     permissions:
       contents: read
+      pull-requests: read
     steps:
+      - name: Resolve preview metadata
+        id: preview
+        uses: actions/github-script@v8
+        env:
+          DISPATCH_PULL_NUMBER: ${{ inputs.pull_number }}
+        with:
+          script: |
+            const fs = require('fs');
+            const path = require('path');
+
+            const value = context.eventName === 'workflow_dispatch'
+              ? process.env.DISPATCH_PULL_NUMBER
+              : String(context.payload.pull_request?.number ?? '');
+            if (!/^[1-9][0-9]*$/.test(value)) {
+              core.setFailed('The pull request number is invalid.');
+              return;
+            }
+
+            const pullNumber = Number(value);
+            const {data: pull} = await github.rest.pulls.get({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              pull_number: pullNumber,
+            });
+            if (pull.state !== 'open') {
+              core.setFailed(`Pull request #${pullNumber} is not open.`);
+              return;
+            }
+
+            const eventHeadSha = context.payload.pull_request?.head?.sha;
+            if (eventHeadSha && eventHeadSha !== pull.head.sha) {
+              core.setFailed(`Pull request #${pullNumber} changed after this run started.`);
+              return;
+            }
+
+            const revision = `pr-${pullNumber}-${pull.head.sha}`;
+            core.setOutput('pull-number', String(pullNumber));
+            core.setOutput('head-sha', pull.head.sha);
+            core.setOutput('revision', revision);
+
+            const metadata = path.join(process.env.GITHUB_WORKSPACE, 'preview-metadata');
+            fs.mkdirSync(metadata, {recursive: true});
+            fs.writeFileSync(path.join(metadata, 'pr-number'), `${pullNumber}\n`);
+            fs.writeFileSync(path.join(metadata, 'head-sha'), `${pull.head.sha}\n`);
+            fs.writeFileSync(path.join(metadata, 'revision'), `${revision}\n`);
+            fs.writeFileSync(path.join(metadata, 'event'), `${context.eventName}\n`);
+
+      # Upload metadata before processing PR-controlled documentation. Artifacts
+      # are immutable, so code executed by the build cannot replace these values.
+      - name: Upload preview metadata
+        uses: actions/upload-artifact@v6
+        with:
+          name: preview-metadata
+          path: preview-metadata/
+          retention-days: 1
+
       - name: Checkout
         uses: actions/checkout@v5
         with:
-          ref: ${{ github.event_name == 'workflow_dispatch' && format('refs/pull/{0}/head', inputs.pull_number) || github.event.pull_request.head.sha }}
-
-      - name: Get commit SHA
-        id: sha
-        run: echo "value=$(git rev-parse HEAD)" >> $GITHUB_OUTPUT
+          ref: ${{ steps.preview.outputs.head-sha }}
 
       - name: Disable PDF for PR build
         run: yq -i '.["docs-viewer"].pdf = false | .singlePage = false' ydb/docs/.yfm
@@ -46,7 +99,7 @@ jobs:
       - name: Build
         uses: diplodoc-platform/docs-build-action@v3
         with:
-          revision: "pr-${{ github.event_name == 'workflow_dispatch' && inputs.pull_number || github.event.pull_request.number }}-${{ steps.sha.outputs.value }}"
+          revision: ${{ steps.preview.outputs.revision }}
           src-root: "./ydb/docs"
           cli-version: "4.59.12"
           use-ya-opensource: true
@@ -68,26 +121,3 @@ jobs:
             exit 1
           fi
           echo "No documentation build warnings or errors"
-
-      # docs-build-action writes github.event.number to inputs/pr-number.
-      # For workflow_dispatch this field is empty, so patch the artifact.
-      - name: Download inputs artifact
-        if: github.event_name == 'workflow_dispatch'
-        uses: actions/download-artifact@v4
-        with:
-          name: inputs
-          path: ./inputs
-
-      - name: Save PR number to inputs artifact
-        if: github.event_name == 'workflow_dispatch'
-        env:
-          PULL_NUMBER: ${{ inputs.pull_number }}
-        run: printf '%s' "$PULL_NUMBER" > ./inputs/pr-number
-
-      - name: Upload inputs artifact
-        if: github.event_name == 'workflow_dispatch'
-        uses: actions/upload-artifact@v4
-        with:
-          name: inputs
-          path: ./inputs/
-          overwrite: true

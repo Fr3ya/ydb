@@ -4,32 +4,332 @@ on:
   workflow_run:
     workflows:
       - Build documentation
-      - Rebuild documentation
     types:
       - completed
 
-jobs:
-  post-build:
-    permissions: write-all
-    concurrency:
-      group: preview-documentation-${{ github.event.workflow_run.id }}
-      cancel-in-progress: true
-    runs-on: ubuntu-latest
-    steps:
-      - name: Upload
-        uses: diplodoc-platform/docs-upload-action@v1
-        if: github.event.workflow_run.conclusion == 'success'
-        with:
-          github-token: ${{ secrets.GITHUB_TOKEN }}
-          storage-endpoint: ${{ vars.DOCS_AWS_ENDPOINT }}
-          storage-region: ${{ vars.DOCS_AWS_REGION }}
-          storage-bucket: ${{ vars.DIPLODOC_STORAGE_BUCKET }}
-          storage-access-key-id: ${{ secrets.DOCS_AWS_KEY_ID }}
-          storage-secret-access-key: ${{ secrets.DOCS_AWS_SECRET_ACCESS_KEY }}
-          cli-version: stable
+permissions: {}
 
-      - name: Comment message
-        uses: diplodoc-platform/docs-message-action@v1
+concurrency:
+  group: preview-documentation-${{ github.event.workflow_run.id }}
+  cancel-in-progress: true
+
+jobs:
+  validate:
+    name: Validate preview artifacts
+    if: |
+      github.event.workflow_run.path == '.github/workflows/docs_build.yaml' &&
+      (github.event.workflow_run.event == 'pull_request' ||
+       github.event.workflow_run.event == 'workflow_dispatch')
+    runs-on: ubuntu-latest
+    permissions:
+      actions: read
+      pull-requests: read
+    outputs:
+      pull-number: ${{ steps.metadata.outputs.pull-number }}
+      revision: ${{ steps.metadata.outputs.revision }}
+    steps:
+      - name: Validate source run and artifact inventory
+        id: inventory
+        uses: actions/github-script@v8
         with:
-          github-token: ${{ secrets.GITHUB_TOKEN }}
-          project-link: ${{ vars.DIPLODOC_PROJECT_LINK }}
+          script: |
+            const run = context.payload.workflow_run;
+            if (run.repository.id !== context.payload.repository.id) {
+              core.setFailed('The source workflow belongs to a different repository.');
+              return;
+            }
+            if (run.path !== '.github/workflows/docs_build.yaml') {
+              core.setFailed(`Unexpected source workflow path: ${run.path}`);
+              return;
+            }
+            if (!['pull_request', 'workflow_dispatch'].includes(run.event)) {
+              core.setFailed(`Unexpected source event: ${run.event}`);
+              return;
+            }
+
+            const artifacts = await github.paginate(
+              github.rest.actions.listWorkflowRunArtifacts,
+              {
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                run_id: run.id,
+                per_page: 100,
+              },
+            );
+
+            const requireArtifact = (name, maximumSize) => {
+              const matches = artifacts.filter((artifact) =>
+                artifact.name === name && !artifact.expired);
+              if (matches.length !== 1) {
+                throw new Error(
+                  `Expected exactly one non-expired ${name} artifact; found ${matches.length}.`,
+                );
+              }
+              if (matches[0].size_in_bytes > maximumSize) {
+                throw new Error(`${name} exceeds the allowed compressed size.`);
+              }
+              return matches[0];
+            };
+
+            const metadata = requireArtifact('preview-metadata', 64 * 1024);
+            core.setOutput('metadata-id', String(metadata.id));
+
+            if (run.conclusion === 'success') {
+              const build = requireArtifact('build-output-md', 512 * 1024 * 1024);
+              core.setOutput('build-id', String(build.id));
+            }
+
+      - name: Download preview metadata
+        uses: actions/download-artifact@v7
+        with:
+          artifact-ids: ${{ steps.inventory.outputs.metadata-id }}
+          github-token: ${{ github.token }}
+          repository: ${{ github.repository }}
+          run-id: ${{ github.event.workflow_run.id }}
+          path: preview-metadata
+
+      - name: Validate preview metadata
+        id: metadata
+        uses: actions/github-script@v8
+        env:
+          PROJECT_LINK: ${{ vars.DIPLODOC_PROJECT_LINK }}
+        with:
+          script: |
+            const fs = require('fs');
+            const path = require('path');
+            const run = context.payload.workflow_run;
+
+            const readValue = (name, pattern) => {
+              const file = path.join('preview-metadata', name);
+              const raw = fs.readFileSync(file, 'utf8');
+              const value = raw.endsWith('\n') ? raw.slice(0, -1) : raw;
+              if (value.includes('\n') || value.includes('\r') || !pattern.test(value)) {
+                throw new Error(`Invalid ${name} value.`);
+              }
+              return value;
+            };
+
+            const pullNumberText = readValue('pr-number', /^[1-9][0-9]*$/);
+            const headSha = readValue('head-sha', /^[0-9a-f]{40}$/);
+            const revision = readValue(
+              'revision',
+              /^pr-[1-9][0-9]*-[0-9a-f]{40}$/,
+            );
+            const event = readValue(
+              'event',
+              /^(pull_request|workflow_dispatch)$/,
+            );
+            const pullNumber = Number(pullNumberText);
+
+            if (event !== run.event) {
+              throw new Error('The metadata event does not match the source run.');
+            }
+            if (revision !== `pr-${pullNumber}-${headSha}`) {
+              throw new Error('The revision does not match the pull request and SHA.');
+            }
+            if (run.event === 'pull_request') {
+              const linked = run.pull_requests?.some(
+                (pull) => pull.number === pullNumber,
+              );
+              if (!linked || run.head_sha !== headSha) {
+                throw new Error('The source run does not match the pull request metadata.');
+              }
+            }
+
+            const {data: pull} = await github.rest.pulls.get({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              pull_number: pullNumber,
+            });
+            if (pull.state !== 'open' || pull.head.sha !== headSha) {
+              throw new Error('The pull request is closed or has moved to a newer SHA.');
+            }
+
+            core.setOutput('pull-number', pullNumberText);
+            core.setOutput('revision', revision);
+
+            const successful = run.conclusion === 'success';
+            const lines = [
+              `### ${successful ? ':white_check_mark:' : ':x:'} Documentation build`,
+              '',
+              successful
+                ? 'Revision built successfully.'
+                : `Revision build finished with status: ${run.conclusion}.`,
+            ];
+            if (successful && process.env.PROJECT_LINK) {
+              const separator = process.env.PROJECT_LINK.includes('?') ? '&' : '?';
+              const link = `${process.env.PROJECT_LINK}${separator}revision=${encodeURIComponent(revision)}`;
+              lines.push('', `Revision preview [link](${link}).`);
+            }
+            lines.push('', `[View workflow run](${run.html_url}).`);
+            fs.mkdirSync('preview-message', {recursive: true});
+            fs.writeFileSync('preview-message/body.md', `${lines.join('\n')}\n`);
+
+      - name: Download build output
+        if: github.event.workflow_run.conclusion == 'success'
+        uses: actions/download-artifact@v7
+        with:
+          artifact-ids: ${{ steps.inventory.outputs.build-id }}
+          github-token: ${{ github.token }}
+          repository: ${{ github.repository }}
+          run-id: ${{ github.event.workflow_run.id }}
+          path: build-output-md
+
+      - name: Validate build output
+        if: github.event.workflow_run.conclusion == 'success'
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          if [[ ! -d build-output-md ]]; then
+            echo "::error::The build output directory is missing."
+            exit 1
+          fi
+
+          if find build-output-md -mindepth 1 \
+              ! -type f ! -type d -print -quit | grep -q .; then
+            echo "::error::The build output contains a non-regular file."
+            exit 1
+          fi
+
+          while IFS= read -r -d '' path; do
+            if [[ "$path" == *$'\n'* || "$path" == *$'\r'* ]]; then
+              echo "::error::The build output contains an invalid path."
+              exit 1
+            fi
+          done < <(find build-output-md -mindepth 1 -print0)
+
+          file_count=$(find build-output-md -type f -printf '.' | wc -c)
+          byte_count=$(du -sb build-output-md | cut -f1)
+          if (( file_count > 250000 )); then
+            echo "::error::The build output contains too many files."
+            exit 1
+          fi
+          if (( byte_count > 4294967296 )); then
+            echo "::error::The extracted build output exceeds 4 GiB."
+            exit 1
+          fi
+
+      - name: Relay validated build output
+        if: github.event.workflow_run.conclusion == 'success'
+        uses: actions/upload-artifact@v6
+        with:
+          name: validated-build-output
+          path: build-output-md/
+          include-hidden-files: true
+          retention-days: 1
+
+      - name: Save validated preview message
+        uses: actions/upload-artifact@v6
+        with:
+          name: validated-preview-message
+          path: preview-message/body.md
+          retention-days: 1
+
+  publish:
+    name: Publish preview
+    needs: validate
+    if: |
+      needs.validate.result == 'success' &&
+      github.event.workflow_run.conclusion == 'success'
+    runs-on: ubuntu-latest
+    permissions: {}
+    steps:
+      - name: Download validated build output
+        uses: actions/download-artifact@v7
+        with:
+          name: validated-build-output
+          path: build-output-md
+
+      - name: Resolve storage target
+        shell: bash
+        env:
+          REVISION: ${{ needs.validate.outputs.revision }}
+          STORAGE_BUCKET: ${{ vars.DIPLODOC_STORAGE_BUCKET }}
+        run: |
+          set -euo pipefail
+
+          if [[ ! "$REVISION" =~ ^pr-[1-9][0-9]*-[0-9a-f]{40}$ ]]; then
+            echo "::error::Invalid revision."
+            exit 1
+          fi
+          if [[ -z "$STORAGE_BUCKET" ||
+                ! "$STORAGE_BUCKET" =~ ^[A-Za-z0-9._/-]+$ ||
+                "$STORAGE_BUCKET" == /* ||
+                "$STORAGE_BUCKET" == */ ||
+                "$STORAGE_BUCKET" == *..* ||
+                "$STORAGE_BUCKET" == *//* ]]; then
+            echo "::error::Invalid storage bucket."
+            exit 1
+          fi
+
+          if [[ "$STORAGE_BUCKET" == */* ]]; then
+            bucket="${STORAGE_BUCKET%%/*}-stable"
+            prefix="${STORAGE_BUCKET#*/}/rev/${REVISION}"
+          else
+            bucket="${STORAGE_BUCKET}-stable"
+            prefix="rev/${REVISION}"
+          fi
+
+          printf 'DOCS_BUCKET=%s\nDOCS_PREFIX=%s\n' "$bucket" "$prefix" >> "$GITHUB_ENV"
+
+      # This job never executes files from the artifact. The AWS CLI only
+      # copies the validated regular files to the revision-scoped prefix.
+      - name: Upload preview
+        shell: bash
+        env:
+          AWS_ACCESS_KEY_ID: ${{ secrets.DOCS_AWS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.DOCS_AWS_SECRET_ACCESS_KEY }}
+          AWS_EC2_METADATA_DISABLED: "true"
+          STORAGE_ENDPOINT: ${{ vars.DOCS_AWS_ENDPOINT }}
+          STORAGE_REGION: ${{ vars.DOCS_AWS_REGION }}
+        run: |
+          set -euo pipefail
+          aws s3 sync \
+            build-output-md/ \
+            "s3://${DOCS_BUCKET}/${DOCS_PREFIX}/" \
+            --endpoint-url "$STORAGE_ENDPOINT" \
+            --region "$STORAGE_REGION" \
+            --no-follow-symlinks \
+            --only-show-errors
+
+  comment:
+    name: Comment on pull request
+    needs:
+      - validate
+      - publish
+    if: |
+      always() &&
+      needs.validate.result == 'success' &&
+      (github.event.workflow_run.conclusion != 'success' ||
+       needs.publish.result == 'success')
+    runs-on: ubuntu-latest
+    permissions:
+      pull-requests: write
+    steps:
+      - name: Download validated preview message
+        uses: actions/download-artifact@v7
+        with:
+          name: validated-preview-message
+          path: preview-message
+
+      - name: Comment
+        uses: actions/github-script@v8
+        env:
+          PULL_NUMBER: ${{ needs.validate.outputs.pull-number }}
+        with:
+          script: |
+            const fs = require('fs');
+            const pullNumber = Number(process.env.PULL_NUMBER);
+            if (!Number.isSafeInteger(pullNumber) || pullNumber < 1) {
+              core.setFailed('Invalid pull request number.');
+              return;
+            }
+
+            const body = fs.readFileSync('preview-message/body.md', 'utf8');
+            await github.rest.issues.createComment({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: pullNumber,
+              body,
+            });
