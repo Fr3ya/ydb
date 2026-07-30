@@ -32,19 +32,6 @@ jobs:
         with:
           script: |
             const run = context.payload.workflow_run;
-            if (run.repository.id !== context.payload.repository.id) {
-              core.setFailed('The source workflow belongs to a different repository.');
-              return;
-            }
-            if (run.path !== '.github/workflows/docs_build.yaml') {
-              core.setFailed(`Unexpected source workflow path: ${run.path}`);
-              return;
-            }
-            if (!['pull_request', 'workflow_dispatch'].includes(run.event)) {
-              core.setFailed(`Unexpected source event: ${run.event}`);
-              return;
-            }
-
             const artifacts = await github.paginate(
               github.rest.actions.listWorkflowRunArtifacts,
               {
